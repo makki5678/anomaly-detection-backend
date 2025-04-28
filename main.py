@@ -1,112 +1,76 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
-import io
 import numpy as np
 from sklearn.ensemble import IsolationForest
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
+import io
 import logging
 
-# Logger manually set up
+# Initialize logger
 logger = logging.getLogger("anomaly_detector")
-if not logger.hasHandlers():
-    stream_handler = logging.StreamHandler()
-    formatter = logging.Formatter('%(levelname)s:%(message)s')
-    stream_handler.setFormatter(formatter)
-    logger.addHandler(stream_handler)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-app = FastAPI()
+app = FastAPI(title="Anomaly Detection API", version="1.0")
 
-# Allow only frontend during dev
+# CORS setup (specific origins should be preferred in production)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["POST", "GET"],
+    allow_headers=["*"]
 )
 
 @app.get("/")
-def home():
-    return {"status": "API running"}
+def root():
+    return {"message": "Anomaly Detection API is live."}
 
 @app.post("/upload/")
-async def process_csv(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".csv"):
-        raise HTTPException(status_code=415, detail="Please upload a CSV file only.")
+async def upload_csv(file: UploadFile = File(...)):
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=415, detail="Unsupported file type. Please upload a CSV.")
 
     try:
         content = await file.read()
-        df = pd.read_csv(io.StringIO(content.decode('utf-8')))
+        df = pd.read_csv(io.StringIO(content.decode("utf-8")))
+    except UnicodeDecodeError as e:
+        logger.error(f"File decoding error: {e}")
+        raise HTTPException(status_code=400, detail="Unable to decode uploaded file.")
     except Exception as e:
-        logger.error(f"File reading failed: {str(e)}")
-        raise HTTPException(status_code=400, detail="Failed to read CSV file.")
+        logger.error(f"Error reading CSV: {e}")
+        raise HTTPException(status_code=400, detail="Failed to process CSV.")
 
     if df.empty:
         raise HTTPException(status_code=400, detail="Uploaded CSV is empty.")
 
-    # Check if labels exist
-    has_labels = False
-    if df.columns[-1].strip().lower() == 'label':
-        has_labels = True
-        X = df.iloc[:, :-1]
-        y = df.iloc[:, -1]
-    else:
-        X = df.copy()
-        y = np.zeros(X.shape[0])
-
-    # Keep only numeric columns
-    X_numeric = X.select_dtypes(include=[np.number])
-    if X_numeric.empty:
-        raise HTTPException(status_code=422, detail="No numeric features found for modeling.")
+    y_true = None
+    if "label" in df.columns:
+        y_true = df.pop("label")
 
     try:
-        if has_labels:
-            X_train, X_test, y_train, y_test = train_test_split(X_numeric, y, test_size=0.2, stratify=y, random_state=42)
-        else:
-            X_train, X_test, y_train, y_test = train_test_split(X_numeric, y, test_size=0.2, random_state=42)
+        model = IsolationForest(contamination=0.1, random_state=42)
+        model.fit(df)
+        pred_raw = model.predict(df)
+        preds = np.where(pred_raw == -1, 1, 0)
     except Exception as e:
-        logger.error(f"Data splitting issue: {str(e)}")
-        raise HTTPException(status_code=500, detail="Problem splitting dataset.")
+        logger.error(f"Model training failed: {e}")
+        raise HTTPException(status_code=500, detail="Model training failed.")
 
-    try:
-        clf = IsolationForest(contamination=0.05, random_state=42)
-        clf.fit(X_train)
-    except Exception as e:
-        logger.error(f"Model training issue: {str(e)}")
-        raise HTTPException(status_code=500, detail="Model failed during training.")
+    report = classification_report(y_true, preds, output_dict=True) if y_true is not None else None
 
-    try:
-        pred = clf.predict(X_test)
-        pred = np.where(pred == 1, 0, 1)  # Flip: 0 = normal, 1 = anomaly
+    anomalies = df[preds == 1]
+    sample_anomalies = anomalies.head(5).to_dict(orient="records") if not anomalies.empty else []
 
-        results = {}
+    response = {
+        "anomaly_count": int(np.sum(preds)),
+        "predictions": preds.tolist(),
+        "classification_report": report,
+        "anomaly_samples": sample_anomalies
+    }
 
-        if has_labels:
-            report = classification_report(y_test, pred, output_dict=True)
-            results['report'] = report
-        else:
-            results['report'] = None
-
-        scores = clf.decision_function(X_test)
-        top_anomalies = np.argsort(scores)[:5]
-
-        important_features = []
-        for idx in top_anomalies:
-            row = X_test.iloc[idx]
-            important = row.abs().sort_values(ascending=False).head(3)
-            important_features.append(important.to_dict())
-
-        results.update({
-            "predictions": pred.tolist(),
-            "num_anomalies": int(sum(pred)),
-            "important_features": important_features
-        })
-
-        return results
-
-    except Exception as e:
-        logger.error(f"Prediction/reporting issue: {str(e)}")
-        raise HTTPException(status_code=500, detail="Prediction phase failed.")
+    return response
