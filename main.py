@@ -1,74 +1,89 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
+import io
 import numpy as np
 from sklearn.ensemble import IsolationForest
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
-import io
 import logging
 
-# Configure logging
+# Logger manually set up
 logger = logging.getLogger("anomaly_detector")
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-    logger.addHandler(handler)
+if not logger.hasHandlers():
+    stream_handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(levelname)s:%(message)s")
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
 logger.setLevel(logging.INFO)
 
-app = FastAPI(title="Anomaly Detection Service", version="1.0.0")
+app = FastAPI()
 
-# Middleware configuration
+# Allow all origins for deployment (safe with CORS config)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # allow all
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
 @app.get("/")
-def read_root():
-    return {"message": "Anomaly Detection API is operational."}
+def home():
+    return {"status": "API running"}
 
 @app.post("/upload/")
-async def upload_file(file: UploadFile = File(...)):
+async def process_csv(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".csv"):
-        raise HTTPException(status_code=415, detail="Unsupported file type. Only CSV is allowed.")
+        raise HTTPException(status_code=415, detail="Please upload a CSV file only.")
 
     try:
         content = await file.read()
-        df = pd.read_csv(io.StringIO(content.decode("utf-8")))
-    except UnicodeDecodeError as e:
-        logger.error(f"Decoding error: {e}")
-        raise HTTPException(status_code=400, detail="Could not decode uploaded file.")
+        df = pd.read_csv(io.StringIO(content.decode('utf-8')))
+        df = df.select_dtypes(include=[np.number])  # Only keep numeric columns
     except Exception as e:
-        logger.error(f"Failed to process CSV: {e}")
-        raise HTTPException(status_code=400, detail="Error processing CSV file.")
+        logger.error(f"File reading failed: {str(e)}")
+        raise HTTPException(status_code=400, detail="Failed to read CSV file.")
 
     if df.empty:
-        raise HTTPException(status_code=400, detail="Uploaded CSV file is empty.")
+        raise HTTPException(status_code=400, detail="No numeric data available for analysis.")
 
-    y_true = None
-    if "Class" in df.columns:
-        y_true = df.pop("Class")
+    # Check if labels exist
+    has_labels = 'label' in df.columns or 'Class' in df.columns
 
-    try:
-        model = IsolationForest(n_estimators=100, contamination=0.1, random_state=42)
-        model.fit(df)
-        raw_preds = model.predict(df)
-        preds = np.where(raw_preds == -1, 1, 0)
-    except Exception as e:
-        logger.error(f"Model training or prediction failed: {e}")
-        raise HTTPException(status_code=500, detail="Anomaly detection failed.")
+    # Separate features and labels
+    if has_labels:
+        if 'label' in df.columns:
+            X = df.drop('label', axis=1)
+            y_true = df['label']
+        else:
+            X = df.drop('Class', axis=1)
+            y_true = df['Class']
+    else:
+        X = df
+        y_true = None
 
-    classification = classification_report(y_true, preds, output_dict=True) if y_true is not None else None
+    # Train Isolation Forest
+    model = IsolationForest(contamination=0.1, random_state=42)
+    model.fit(X)
+    preds = model.predict(X)
 
-    anomalies_detected = df[preds == 1]
-    example_anomalies = anomalies_detected.head(5).to_dict(orient="records") if not anomalies_detected.empty else []
+    # Convert anomaly scores to binary: 1 (anomaly), 0 (normal)
+    preds = np.where(preds == -1, 1, 0)
+
+    # Generate report
+    if y_true is not None:
+        report = classification_report(y_true, preds, output_dict=True)
+    else:
+        report = None
+
+    # Top anomaly explanation: showing top 5 anomalies with their feature values
+    anomaly_rows = X[preds == 1]
+    top_anomalies = anomaly_rows.head(5).to_dict(orient="records")
 
     return {
         "predictions": preds.tolist(),
-        "anomaly_count": int(preds.sum()),
-        "classification_report": classification,
-        "sample_anomalies": example_anomalies
+        "anomaly_count": int(sum(preds)),
+        "classification_report": report,
+        "anomaly_explanations": top_anomalies,
     }
