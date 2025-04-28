@@ -45,12 +45,12 @@ async def process_csv(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Failed to read CSV file.")
 
     # Check if labels exist
-    has_labels = 'label' in df.columns
+    has_labels = 'Class' in df.columns
 
     # Separate features and labels
     if has_labels:
-        X = df.drop('label', axis=1)
-        y_true = df['label']
+         X = df.drop('Class', axis=1)
+        y_true = df['Class']
     else:
         X = df
         y_true = None
