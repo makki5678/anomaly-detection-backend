@@ -22,7 +22,7 @@ app = FastAPI()
 # Allow all origins for deployment (safe with CORS config)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # allow all for now
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -49,7 +49,7 @@ async def process_csv(file: UploadFile = File(...)):
 
     # Separate features and labels
     if has_labels:
-         X = df.drop('Class', axis=1)
+        X = df.drop('Class', axis=1)
         y_true = df['Class']
     else:
         X = df
