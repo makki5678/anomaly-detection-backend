@@ -19,10 +19,10 @@ logger.setLevel(logging.INFO)
 
 app = FastAPI()
 
-# Allow all origins for deployment (safe with CORS config)
+# Allow all origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # allow all
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,27 +40,28 @@ async def process_csv(file: UploadFile = File(...)):
     try:
         content = await file.read()
         df = pd.read_csv(io.StringIO(content.decode('utf-8')))
-        df = df.select_dtypes(include=[np.number])  # Only keep numeric columns
     except Exception as e:
         logger.error(f"File reading failed: {str(e)}")
         raise HTTPException(status_code=400, detail="Failed to read CSV file.")
 
-    if df.empty:
-        raise HTTPException(status_code=400, detail="No numeric data available for analysis.")
+    # Select only numeric columns
+    df_numeric = df.select_dtypes(include=[np.number])
+
+    if df_numeric.empty:
+        raise HTTPException(status_code=400, detail="No usable numeric data found in the uploaded CSV.")
 
     # Check if labels exist
-    has_labels = 'label' in df.columns or 'Class' in df.columns
+    has_labels = 'label' in df_numeric.columns or 'Class' in df_numeric.columns
 
     # Separate features and labels
-    if has_labels:
-        if 'label' in df.columns:
-            X = df.drop('label', axis=1)
-            y_true = df['label']
-        else:
-            X = df.drop('Class', axis=1)
-            y_true = df['Class']
+    if 'label' in df_numeric.columns:
+        X = df_numeric.drop('label', axis=1)
+        y_true = df_numeric['label']
+    elif 'Class' in df_numeric.columns:
+        X = df_numeric.drop('Class', axis=1)
+        y_true = df_numeric['Class']
     else:
-        X = df
+        X = df_numeric
         y_true = None
 
     # Train Isolation Forest
@@ -68,16 +69,13 @@ async def process_csv(file: UploadFile = File(...)):
     model.fit(X)
     preds = model.predict(X)
 
-    # Convert anomaly scores to binary: 1 (anomaly), 0 (normal)
     preds = np.where(preds == -1, 1, 0)
 
-    # Generate report
     if y_true is not None:
         report = classification_report(y_true, preds, output_dict=True)
     else:
         report = None
 
-    # Top anomaly explanation: showing top 5 anomalies with their feature values
     anomaly_rows = X[preds == 1]
     top_anomalies = anomaly_rows.head(5).to_dict(orient="records")
 
